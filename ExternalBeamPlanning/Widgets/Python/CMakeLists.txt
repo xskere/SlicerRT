@@ -4,6 +4,7 @@ add_subdirectory(PlanOptimizers)
 #-----------------------------------------------------------------------------
 set(Python_PYTHON_SCRIPTS
   PyRadPlanUtils.py
+  TopasDoseEngineUtil.py
   )
 
 set(DoseEngines_PYTHON_SCRIPTS
