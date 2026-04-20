@@ -1,8 +1,11 @@
 #ifndef __qSlicerIpoptOptimizer_h
 #define __qSlicerIpoptOptimizer_h
 
+// ExternalBeamPlanning includes
+#include "qSlicerAbstractPlanOptimizer.h"
+#include "qSlicerExternalBeamPlanningModuleWidgetsExport.h"
+
 // Qt includes
-#include <QObject>
 #include <QMap>
 #include <QVariant>
 #include <QString>
@@ -17,52 +20,49 @@
 #include <map>
 #include <functional>
 #include <memory>
-#include <atomic>
-#include <thread>
 
-#include "qSlicerExternalBeamPlanningModuleWidgetsExport.h"
+#include <vtkSmartPointer.h>
 
 using namespace Ipopt;
 
 class qSlicerIpoptOptimizerPrivate;
+class vtkMRMLRTPlanNode;
+class vtkMRMLRTObjectiveNode;
+class vtkMRMLScalarVolumeNode;
 
 /// \brief Interior Point Optimizer using IPOPT
 ///
-/// This class provides a C++ interface to the IPOPT optimization library,
-/// translating the functionality from the Python OptimizerIpopt class.
-class Q_SLICER_MODULE_EXTERNALBEAMPLANNING_WIDGETS_EXPORT qSlicerIpoptOptimizer : public QObject
+/// Integrates the IPOPT solver with the SlicerRT plan optimization framework.
+/// Inherits from qSlicerAbstractPlanOptimizer so it can be registered with the
+/// plugin handler and invoked through the ExternalBeamPlanning module UI.
+class Q_SLICER_MODULE_EXTERNALBEAMPLANNING_WIDGETS_EXPORT qSlicerIpoptOptimizer
+  : public qSlicerAbstractPlanOptimizer
 {
   Q_OBJECT
 
 public:
-  typedef QObject Superclass;
+  typedef qSlicerAbstractPlanOptimizer Superclass;
 
-  /// Constructor
   explicit qSlicerIpoptOptimizer(QObject* parent = nullptr);
-
-  /// Destructor
   ~qSlicerIpoptOptimizer() override;
 
-  /// Optimizer properties
   static const QString NAME;
   static const QString SHORT_NAME;
   static const bool GPU_COMPATIBLE;
   static const bool ALLOW_KEYBOARD_CANCEL;
 
-  /// Default tolerances and limits
-  static const double DEFAULT_TOLERANCE;
   static const double DEFAULT_ABS_OBJ_TOL;
   static const int DEFAULT_MAX_ITER;
   static const double DEFAULT_MAX_TIME;
 
+  /// Register all available objective and constraint types.
+  void setAvailableObjectives() override;
+
 public:
-  /// Type definitions for arrays and callbacks
   using Array = std::vector<double>;
   using ObjectiveFunction = std::function<double(const Array&)>;
   using GradientFunction = std::function<Array(const Array&)>;
-  using CallbackFunction = std::function<bool(int, double, const Array&)>;
 
-  /// Options container
   struct Options {
     int print_level = 5;
     QString print_user_options = "no";
@@ -87,7 +87,6 @@ public:
     QString print_timing_statistics = "yes";
   };
 
-  /// Result structure
   struct Result {
     Array solution;
     ApplicationReturnStatus status;
@@ -97,48 +96,38 @@ public:
   };
 
 public slots:
-  /// Set optimization parameters
   void setMaxIterations(int maxIter);
   void setMaxTime(double maxTime);
   void setAbsoluteObjectiveTolerance(double tol);
 
-  /// Set objective and gradient functions
   void setObjectiveFunction(ObjectiveFunction func);
   void setGradientFunction(GradientFunction func);
-  void setIntermediateCallback(CallbackFunction callback);
-
-  /// Enable/disable keyboard cancellation
-  void setKeyboardCancelEnabled(bool enabled);
-
-  /// Request cancellation
-  void requestCancellation();
 
 public:
-  /// Solve the optimization problem
   Result solveProblem(const Array& x0);
 
-  /// Get/set options
   Options getOptions() const;
   void setOptions(const Options& options);
   void setOption(const QString& key, const QVariant& value);
 
-  /// Get the last result
   Result getLastResult() const;
 
 signals:
-  /// Emitted during optimization iterations
   void iterationUpdate(int iteration, double objectiveValue);
-
-  /// Emitted when optimization completes
   void optimizationCompleted(bool success, const QString& message);
 
+protected:
+  /// Called by the ExternalBeamPlanning module to run the optimizer on a plan.
+  QString optimizePlanUsingOptimizer(
+    vtkMRMLRTPlanNode* planNode,
+    std::vector<vtkSmartPointer<vtkMRMLRTObjectiveNode>> objectives,
+    vtkMRMLScalarVolumeNode* resultOptimizationVolumeNode) override;
+
 private:
-  /// Private implementation
   QScopedPointer<qSlicerIpoptOptimizerPrivate> d_ptr;
   Q_DECLARE_PRIVATE(qSlicerIpoptOptimizer);
   Q_DISABLE_COPY(qSlicerIpoptOptimizer);
 
-  /// Internal TNLP implementation
   class IpoptProblem;
   friend class IpoptProblem;
 };
