@@ -23,6 +23,7 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
     self.topasBinaryPath = '/home/xskere/topas/bin/topas'
     self.g4dataPath = '/home/xskere/G4Data'
     self.rtIonPlanFilePath = ''  # Optional: Path to RT Ion Plan DICOM file for TsRTIonSource
+    self.machineDataFilePath = ''  # Optional: Path to .mat file with energy-dependent spot sigma and SAD
 
     # Load paths from application settings
     self.loadPathsFromApplicationSettings()
@@ -50,6 +51,13 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
       'Number of particles to simulate (more particles = better statistics but slower)',
       100000, 100000000, 1000000, 500000, 0)
 
+    # ParticlesPerHistory: downsampling factor — histories/spot = spot_MU / ParticlesPerHistory
+    # Values < 1 increase histories (better statistics); values > 1 decrease them (faster)
+    self.scriptedEngine.addBeamParameterSpinBox(
+      tabName, 'particlesPerHistory', 'Particles per history',
+      'Downsampling factor for TsRTIonSource. Values < 1 increase histories per spot for better statistics.',
+      0.0001, 1000000.0, 1.0, 0.1, 4)
+
     # Path parameters
     self.scriptedEngine.addBeamParameterLineEdit(
       tabName, 'topasDirectory', 'TOPAS directory:',
@@ -68,6 +76,11 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
       'Path to a DICOM RT Ion Plan file for TsRTIonSource. Leave empty to use the simple beam source.',
       self.rtIonPlanFilePath)
 
+    self.scriptedEngine.addBeamParameterLineEdit(
+      tabName, 'machineDataFile', 'Machine data file (optional):',
+      'Path to a .mat file with energy-dependent spot sigma and SAD (e.g. TROTS MachineData.mat).',
+      self.machineDataFilePath)
+
   #------------------------------------------------------------------------------
   def loadPathsFromApplicationSettings(self):
     """Load TOPAS paths from application settings"""
@@ -76,6 +89,7 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
     self.topasBinaryPath = settings.value('TopasDoseEngine/TopasBinary', self.topasBinaryPath)
     self.g4dataPath = settings.value('TopasDoseEngine/G4DataDirectory', self.g4dataPath)
     self.rtIonPlanFilePath = settings.value('TopasDoseEngine/RTIonPlanFile', self.rtIonPlanFilePath)
+    self.machineDataFilePath = settings.value('TopasDoseEngine/MachineDataFile', self.machineDataFilePath)
 
   #------------------------------------------------------------------------------
   def savePathsInApplicationSettings(self, beamNode=None):
@@ -85,6 +99,7 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
     settings.setValue('TopasDoseEngine/TopasBinary', self.topasBinaryPath)
     settings.setValue('TopasDoseEngine/G4DataDirectory', self.g4dataPath)
     settings.setValue('TopasDoseEngine/RTIonPlanFile', self.rtIonPlanFilePath)
+    settings.setValue('TopasDoseEngine/MachineDataFile', self.machineDataFilePath)
 
   #------------------------------------------------------------------------------
   def calculateDoseUsingEngine(self, beamNode, resultDoseVolumeNode):
@@ -112,6 +127,8 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
       # Override with custom beam parameters from UI
       beamProperties['energy'] = self.scriptedEngine.doubleParameter(beamNode, 'energy')
       beamProperties['numberOfHistories'] = int(self.scriptedEngine.doubleParameter(beamNode, 'numberOfHistories'))
+      beamProperties['particlesPerHistory'] = self.scriptedEngine.doubleParameter(beamNode, 'particlesPerHistory')
+
       _radiationModes = ['proton', 'neutron', 'gamma', 'e-', 'e+']
       radiationModeIdx = int(self.scriptedEngine.parameter(beamNode, 'radiationMode') or 0)
       beamProperties['radiationMode'] = _radiationModes[radiationModeIdx]
@@ -120,12 +137,15 @@ class TopasDoseEngine(AbstractScriptedDoseEngine):
       topasBinaryPath = self.scriptedEngine.parameter(beamNode, 'topasBinary')
       g4dataPath = self.scriptedEngine.parameter(beamNode, 'g4DataDirectory')
       rtIonPlanFilePath = self.scriptedEngine.parameter(beamNode, 'rtIonPlanFile')
+      machineDataFilePath = self.scriptedEngine.parameter(beamNode, 'machineDataFile')
+      beamProperties['machineDataFile'] = machineDataFilePath if machineDataFilePath and os.path.exists(machineDataFilePath) else None
 
       # Persist paths to application settings so they survive session restarts
       self.topasDirectoryPath = topasDirectoryPath
       self.topasBinaryPath = topasBinaryPath
       self.g4dataPath = g4dataPath
       self.rtIonPlanFilePath = rtIonPlanFilePath
+      self.machineDataFilePath = machineDataFilePath
       self.savePathsInApplicationSettings()
 
       logging.info(f"Custom beam parameters: energy={beamProperties['energy']} MeV,"

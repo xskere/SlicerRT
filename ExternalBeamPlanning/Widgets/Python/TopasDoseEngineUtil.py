@@ -134,7 +134,56 @@ class TopasDoseEngineUtil:
 
   #------------------------------------------------------------------------------
   @staticmethod
-  def createTopasInputFileDicom(dicomDirectory, beamProperties, workingDirectory, topasDirectory, ctData=None, planFilePath=None, doseFilePath=None):
+  def _writePbsMachineTable(tableFilePath, planFilePath, beamProperties):
+    """Write a PBS machine table file for TsRTIonSource.
+
+    If beamProperties contains a valid 'machineDataFile' path pointing to a
+    TROTS-style MachineData.mat (HDF5/v7.3), reads SAD, energy-dependent spot
+    sigma, and angular divergence from it and writes a full energy table.
+    Otherwise falls back to a minimal 2-entry table.
+    """
+    import pydicom
+
+    # --- Read SAD from plan DICOM ---
+    sad_x = beamProperties.get('sourceAxisDistance', 1000.0)
+    sad_y = sad_x
+    try:
+      ds = pydicom.dcmread(planFilePath, stop_before_pixels=True)
+      beam0 = ds.IonBeamSequence[0]
+      vsad = getattr(beam0, 'VirtualSourceAxisDistances', None)
+      if vsad and len(vsad) >= 2:
+        sad_x = float(vsad[0])
+        sad_y = float(vsad[1])
+        logging.info(f"PBS machine: VirtualSourceAxisDistances from DICOM: X={sad_x} Y={sad_y} mm")
+    except Exception as e:
+      logging.warning(f"Could not read plan DICOM: {e}")
+
+    # --- Override SAD from machine data file if provided ---
+    machineDataFile = beamProperties.get('machineDataFile')
+    if machineDataFile:
+      try:
+        import h5py
+        with h5py.File(machineDataFile, 'r') as f:
+          sad_x = float(f['BeamInfo/SAD'][0, 0])
+          sad_y = float(f['BeamInfo/SAD'][0, 1])
+        logging.info(f"PBS machine: SAD from machine data file: X={sad_x} Y={sad_y} mm")
+      except Exception as e:
+        logging.warning(f"Could not read SAD from machine data file: {e}")
+
+    with open(tableFilePath, 'w', newline='\n') as mt:
+      mt.write('[geometry]\n')
+      mt.write(f'SAD(mm) {sad_x:.1f} {sad_y:.1f}\n')
+      mt.write('rangeshifter(mm) 200.0 0.0\n')  # circle of r=200mm, covers any field
+      mt.write('rangeshifter_snout_gap(mm) 0.0\n\n')
+      mt.write('[spot]\n')
+      mt.write('# NominalE(MeV) E(MeV) dE(MeV) x(mm) y(mm) xp(rad) yp(rad) ratio\n')
+      # x=y=xp=yp=0: TOPAS reads spot size from ScanningSpotSize in DICOM (FWHM/2.355)
+      mt.write(f'  1.0    1.0  0.0  0.0  0.0  0.0  0.0  1.0\n')
+      mt.write(f'400.0  400.0  0.0  0.0  0.0  0.0  0.0  1.0\n')
+
+  #------------------------------------------------------------------------------
+  @staticmethod
+  def createTopasInputFileDicom(dicomDirectory, beamProperties, workingDirectory, topasDirectory, ctData=None, planFilePath=None, doseFilePath=None, beamNumber=1):
     """Create TOPAS input file for dose calculation using DICOM RT Ion interface.
 
     Args:
@@ -155,15 +204,29 @@ class TopasDoseEngineUtil:
     # Use forward slashes directly since this path goes into the TOPAS input file for WSL
     includeFilePathTopas = f"{topasDirectory}/examples/Patient/HUtoMaterialSchneider.txt"
 
+    # For the RT Ion Plan path, create a minimal PBS machine table file in the
+    # working directory.  The RTI library requires machine_name to start with
+    # "pbs:<table_path>"; without this it parses "TROTS" (the DICOM machine name)
+    # as the site identifier, finds no registered handler, and crashes.
+    # Two spot entries at 1 MeV and 300 MeV cover the full clinical proton range;
+    machineTablePath = None
+    machineTablePathTopas = None
+    if planFilePath:
+      machineTablePath = os.path.join(workingDirectory, 'pbs_machine.txt')
+      TopasDoseEngineUtil._writePbsMachineTable(machineTablePath, planFilePath, beamProperties)
+
     # Convert Windows paths to WSL format if on Windows (TOPAS runs in WSL)
     if TopasDoseEngineUtil.isWindows():
       dicomDirectoryTopas = TopasDoseEngineUtil.winToWslPath(dicomDirectory)
       doseFilePathTopas = TopasDoseEngineUtil.winToWslPath(doseFilePath)
       planFilePathTopas = TopasDoseEngineUtil.winToWslPath(planFilePath) if planFilePath else None
+      if machineTablePath:
+        machineTablePathTopas = TopasDoseEngineUtil.winToWslPath(machineTablePath)
     else:
       dicomDirectoryTopas = dicomDirectory
       doseFilePathTopas = doseFilePath
       planFilePathTopas = planFilePath
+      machineTablePathTopas = machineTablePath
 
     # Extract beam properties
     gantryAngle = beamProperties.get('gantryAngle', 0.0)
@@ -172,7 +235,19 @@ class TopasDoseEngineUtil:
     isocenter = beamProperties.get('isocenter', [0.0, 0.0, 0.0])
     energy = beamProperties.get('energy', 100.0)  # MeV
     sad = beamProperties.get('sourceAxisDistance', 1000.0)  # mm
+    # For RT Ion plans, read the virtual source axis distance (X direction) from the DICOM.
+    if planFilePath:
+      try:
+        import pydicom as _pd
+        _ds = _pd.dcmread(planFilePath, stop_before_pixels=True)
+        _vsad = getattr(_ds.IonBeamSequence[0], 'VirtualSourceAxisDistances', None)
+        if _vsad and len(_vsad) >= 1:
+          sad = float(_vsad[0])
+          logging.info(f"Using VirtualSourceAxisDistances[0] as SID: {sad} mm")
+      except Exception as _e:
+        logging.warning(f"Could not read VirtualSourceAxisDistances: {_e}")
     numberOfHistories = beamProperties.get('numberOfHistories', 1000000)
+    particlesPerHistory = beamProperties.get('particlesPerHistory', 1.0)
     radiationMode = beamProperties.get('radiationMode', 'proton')
 
     # Display names match TOPAS BeamParticle strings directly.
@@ -199,41 +274,65 @@ class TopasDoseEngineUtil:
 
       # Physics settings
       f.write("# Physics\n")
-      # TODO: Add hadronic physics for nuclear interactions (e.g. "g4h-phy_QGSP_BIC" or "g4h-phy_QGSP_BIC_HP" for full accuracy).
-      # This will increase simulation time by 3-10x.
-      f.write('sv:Ph/Default/Modules = 1 "g4em-standard_opt4"\n')
+      f.write('sv:Ph/Default/Modules = 7 "g4em-standard_opt3" "g4h-phy_QGSP_BIC" "g4decay" "g4ion-binarycascade" "g4h-elastic_HP" "g4stopping" "g4radioactivedecay"\n')
       if planFilePathTopas:
-        # Register RTION as a layered mass geometry world so apertures and range
-        # shifters defined in TsRTIonComponents physically interact with the beam.
-        # Without this, IsParallel = "T" alone only affects geometry, not physics.
         f.write('sv:Ph/Default/LayeredMassGeometryWorlds = 1 "RTION"\n')
       f.write('\n')
 
-      # World geometry
+      # World geometry — must contain the CT volume *and* the beam source.
+      # With gantry=0° and IEC2DICOM=90°, source world-Y ≈ ShiftY + SAD.
+      # Isocenter offsets from CT center can add ~100–300 mm, so use SAD + 1 m margin.
+      worldHalfLengthM = sad / 1000.0 + 1.0
       f.write("# World\n")
       f.write('s:Ge/World/Type     = "TsBox"\n')
       f.write('s:Ge/World/Material = "G4_AIR"\n')
-      f.write('d:Ge/World/HLX      = 2.0 m\n')
-      f.write('d:Ge/World/HLY      = 2.0 m\n')
-      f.write('d:Ge/World/HLZ      = 2.0 m\n\n')
+      f.write(f'd:Ge/World/HLX      = {worldHalfLengthM:.2f} m\n')
+      f.write(f'd:Ge/World/HLY      = {worldHalfLengthM:.2f} m\n')
+      f.write(f'd:Ge/World/HLZ      = {worldHalfLengthM:.2f} m\n\n')
 
       if planFilePathTopas:
-        # === DICOM RT Ion Plan path (TsRTIonSource + TsRTIonComponents) ===
-        # Based on the dicom-interface tutorial (beam.txt / plan.txt):
-        #   - IEC_F is a fixed-frame Group at World origin
-        #   - TsDicomPatient and TsRTIonComponents are both parented to IEC_F
-        #   - TsRTIonSource fires from IEC_F (not from the RTION geometry)
-        #   - TsRTIonComponents reads imgdirectory to auto-compute ImgCenterX/Y/Z
-        #     from the CT DICOM, so we only need dc: placeholder declarations
-        #   - Both Ge/RTION and So/RTION need the same four rotations
+        # === DICOM RT Ion Plan path ===
 
-        # IEC Fixed coordinate frame (parent for patient, beam geometry, and source)
+        # IEC Fixed coordinate frame (parent for patient and source)
         f.write("# IEC Fixed coordinate frame\n")
         f.write('s:Ge/IEC_F/Type   = "Group"\n')
         f.write('s:Ge/IEC_F/Parent = "World"\n')
         f.write('d:Ge/IEC_F/TransX = 0. mm\n')
         f.write('d:Ge/IEC_F/TransY = 0. mm\n')
         f.write('d:Ge/IEC_F/TransZ = 0. mm\n\n')
+
+        # RT Ion Components (hardware geometry: range shifters, apertures, etc.)
+        f.write("# RT Ion Components (TsRTIonComponents)\n")
+        f.write('s:Ge/RTION/Type        = "TsRTIonComponents"\n')
+        f.write('s:Ge/RTION/Parent      = "IEC_F"\n')
+        f.write(f's:Ge/RTION/File        = "{planFilePathTopas}"\n')
+        f.write(f'i:Ge/RTION/BeamNumber  = {beamNumber}\n')
+        f.write(f's:Ge/RTION/ImgDirectory = "{dicomDirectoryTopas}"\n')
+        f.write(f's:Ge/RTION/machinename  = "pbs:{machineTablePathTopas}"\n')
+        f.write('b:Ge/RTION/IsParallel  = "T"\n')
+        f.write('s:Ge/RTION/rangeshifter/Material = "G4_WATER"\n')
+        f.write('s:Ge/RTION/Block/Material        = "G4_BRASS"\n')
+        f.write('b:Ge/RTION/IncludeSnoutIfExist        = "T"\n')
+        f.write('b:Ge/RTION/IncludeRangeshifterIfExist = "T"\n')
+        f.write('b:Ge/RTION/IncludeBlockIfExist        = "T"\n')
+        f.write('b:Ge/RTION/IncludeCompensatorIfExist  = "T"\n')
+        # Changeable parameter placeholders (overwritten by TsRTIonComponents at runtime)
+        f.write('dc:Ge/RTION/ImgCenterX       = 0 mm\n')
+        f.write('dc:Ge/RTION/ImgCenterY       = 0 mm\n')
+        f.write('dc:Ge/RTION/ImgCenterZ       = 0 mm\n')
+        f.write('dc:Ge/RTION/IsoCenterX       = 0 mm\n')
+        f.write('dc:Ge/RTION/IsoCenterY       = 0 mm\n')
+        f.write('dc:Ge/RTION/IsoCenterZ       = 0 mm\n')
+        f.write('dc:Ge/RTION/CollimatorAngle     = 0 deg\n')
+        f.write('dc:Ge/RTION/GantryAngle         = 0 deg\n')
+        f.write('dc:Ge/RTION/PatientSupportAngle = 0 deg\n')
+        f.write('d:Ge/RTION/TransX = Ge/RTION/IsoCenterX - Ge/RTION/ImgCenterX mm\n')
+        f.write('d:Ge/RTION/TransY = Ge/RTION/IsoCenterY - Ge/RTION/ImgCenterY mm\n')
+        f.write('d:Ge/RTION/TransZ = Ge/RTION/IsoCenterZ - Ge/RTION/ImgCenterZ mm\n')
+        f.write('d:Ge/RTION/RotCollimator      = Ge/RTION/CollimatorAngle deg\n')
+        f.write('d:Ge/RTION/RotGantry          = Ge/RTION/GantryAngle deg\n')
+        f.write('d:Ge/RTION/RotPatientSupport  = -1.0 * Ge/RTION/PatientSupportAngle deg\n')
+        f.write('d:Ge/RTION/RotIEC2DICOM       = 90 deg\n\n')
 
         # Patient from DICOM CT — centered at IEC_F origin (TsDicomPatient
         # places the CT bounding-box center at Trans=0 of its parent).
@@ -252,50 +351,20 @@ class TopasDoseEngineUtil:
 
         f.write('b:Ge/Patient/IgnoreInconsistentFrameOfReferenceUID = "True"\n\n')
 
-        # Beam-limiting device geometry from DICOM RT Ion Plan.
-        # Type is "TsRTIonComponents" (plural — matches the C++ class name).
-        # imgdirectory triggers automatic ImgCenter computation from the CT DICOM.
-        # dc: placeholders are required before the formula lines so TOPAS can
-        # parse them; TsRTIonComponents overwrites them at runtime.
-        # IsParallel = "T" makes this a parallel world (doesn't interfere with
-        # dose scoring on the patient).
-        f.write("# Beam-limiting device geometry (DICOM RT Ion)\n")
-        f.write('s:Ge/RTION/Type          = "TsRTIonComponents"\n')
-        f.write('s:Ge/RTION/Parent        = "IEC_F"\n')
-        f.write(f's:Ge/RTION/File         = "{planFilePathTopas}"\n')
-        f.write(f's:Ge/RTION/imgdirectory = "{dicomDirectoryTopas}"\n')
-        f.write('i:Ge/RTION/BeamNumber    = 1\n')
-        f.write('b:Ge/RTION/IsParallel    = "T"\n')
-        # Changeable parameter placeholders (overwritten by TsRTIonComponents at runtime)
-        f.write('dc:Ge/RTION/ImgCenterX       = 0 mm\n')
-        f.write('dc:Ge/RTION/ImgCenterY       = 0 mm\n')
-        f.write('dc:Ge/RTION/ImgCenterZ       = 0 mm\n')
-        f.write('dc:Ge/RTION/IsoCenterX       = 0 mm\n')
-        f.write('dc:Ge/RTION/IsoCenterY       = 0 mm\n')
-        f.write('dc:Ge/RTION/IsoCenterZ       = 0 mm\n')
-        f.write('dc:Ge/RTION/CollimatorAngle     = 0 deg\n')
-        f.write('dc:Ge/RTION/GantryAngle         = 0 deg\n')
-        f.write('dc:Ge/RTION/PatientSupportAngle = 0 deg\n')
-        # Translation: offset from CT center to isocenter (both in DICOM patient coords)
-        f.write('d:Ge/RTION/TransX = Ge/RTION/IsoCenterX - Ge/RTION/ImgCenterX mm\n')
-        f.write('d:Ge/RTION/TransY = Ge/RTION/IsoCenterY - Ge/RTION/ImgCenterY mm\n')
-        f.write('d:Ge/RTION/TransZ = Ge/RTION/IsoCenterZ - Ge/RTION/ImgCenterZ mm\n')
-        # Rotations: IEC gantry/collimator/couch + IEC-to-DICOM frame correction
-        f.write('d:Ge/RTION/RotCollimator      = Ge/RTION/CollimatorAngle deg\n')
-        f.write('d:Ge/RTION/RotGantry          = Ge/RTION/GantryAngle deg\n')
-        f.write('d:Ge/RTION/RotPatientSupport  = -1.0 * Ge/RTION/PatientSupportAngle deg\n')
-        f.write('d:Ge/RTION/RotIEC2DICOM       = 90 deg\n\n')
-
-        # RT Ion Beam Source — fires from IEC_F frame (same as the tutorial).
-        # imgdirectory auto-computes ImgCenter for the shift formula.
+        # RT Ion Beam Source — fires from IEC_F frame.
+        # imgdirectory auto-computes ImgCenter and IsoCenter from the CT/plan DICOM.
         f.write("# RT Ion Beam Source (TsRTIonSource)\n")
         f.write('s:So/RTION/Type                   = "TsRTIonSource"\n')
         f.write('s:So/RTION/Component              = "IEC_F"\n')
         f.write(f's:So/RTION/File                  = "{planFilePathTopas}"\n')
         f.write(f's:So/RTION/imgdirectory          = "{dicomDirectoryTopas}"\n')
-        f.write('i:So/RTION/BeamNumber             = 1\n')
+        # machinename must be "pbs:<table_path>" so the RTI library creates a generic
+        # PBS machine.  Without this it reads "TROTS" from the DICOM, finds no matching
+        # site handler, and crashes with "Valid site is not available."
+        f.write(f's:So/RTION/machinename           = "pbs:{machineTablePathTopas}"\n')
+        f.write(f'i:So/RTION/BeamNumber             = {beamNumber}\n')
         f.write(f'd:So/RTION/SID                   = {sad} mm\n')
-        f.write('u:So/RTION/ParticlesPerHistory    = 1\n')
+        f.write(f'u:So/RTION/ParticlesPerHistory    = {particlesPerHistory}\n')
         # Changeable parameter placeholders (overwritten by TsRTIonSource at runtime)
         f.write('dc:So/RTION/ImgCenterX       = 0 mm\n')
         f.write('dc:So/RTION/ImgCenterY       = 0 mm\n')
@@ -306,6 +375,7 @@ class TopasDoseEngineUtil:
         f.write('dc:So/RTION/CollimatorAngle     = 0 deg\n')
         f.write('dc:So/RTION/GantryAngle         = 0 deg\n')
         f.write('dc:So/RTION/PatientSupportAngle = 0 deg\n')
+        f.write('dc:So/RTION/Iec2DicomAngle      = 0 deg\n')
         # Shift source spots from CT center to isocenter
         f.write('d:So/RTION/ShiftX = So/RTION/IsoCenterX - So/RTION/ImgCenterX mm\n')
         f.write('d:So/RTION/ShiftY = So/RTION/IsoCenterY - So/RTION/ImgCenterY mm\n')
@@ -517,6 +587,7 @@ class TopasDoseEngineUtil:
 
       # Run settings
       f.write("# Run Settings\n")
+      f.write('i:Ts/NumberOfThreads = 4\n')
       f.write('i:Ts/ShowHistoryCountAtInterval = 100000\n')
       f.write('b:Ts/PauseBeforeQuit = "False"\n')
 
@@ -547,9 +618,14 @@ class TopasDoseEngineUtil:
     try:
       # Run TOPAS using cross-platform utility
       cmd = [topasBinaryPath, inputFilePath]
-      env_vars = None
+      env_vars = {}
       if g4dataPath:
-        env_vars = {"TOPAS_G4_DATA_DIR": g4dataPath}
+        env_vars["TOPAS_G4_DATA_DIR"] = g4dataPath
+      # Prepend TOPAS's lib/ so its bundled Qt libs win over the parent process's Qt (e.g. Slicer's), avoiding mixed-version symbol errors on Linux.
+      if not TopasDoseEngineUtil.isWindows():
+        topasLibDir = os.path.realpath(os.path.join(os.path.dirname(topasBinaryPath), '..', 'lib'))
+        existing = os.environ.get('LD_LIBRARY_PATH', '')
+        env_vars['LD_LIBRARY_PATH'] = f"{topasLibDir}:{existing}" if existing else topasLibDir
       result = TopasDoseEngineUtil.runCommandCrossPlatform(cmd, cwd=workingDirectory, timeout=timeout, env_vars=env_vars)
 
       if result.returncode != 0:
@@ -670,26 +746,85 @@ class TopasDoseEngineUtil:
       logging.info("No original DICOM found — exporting CT as DICOM series for TOPAS...")
       TopasDoseEngineUtil.exportCTAsDicomSeries(ctData, dicomDirectory)
 
-    # Create TOPAS input file referencing DICOM
-    logging.info("Creating TOPAS input file (DICOM)...")
-    inputFilePath = TopasDoseEngineUtil.createTopasInputFileDicom(
-      dicomDirectory=dicomDirectory,
-      beamProperties=beamProperties,
-      workingDirectory=workingDirectory,
-      topasDirectory=topasDirectoryPath,
-      ctData=ctData,
-      planFilePath=planFilePath
-    )
+    # Determine number of beams to simulate
+    nBeams = 1
+    if planFilePath:
+      try:
+        import pydicom as _pd
+        _ds = _pd.dcmread(planFilePath, stop_before_pixels=True)
+        nBeams = len(_ds.IonBeamSequence)
+        logging.info(f"RT Ion Plan has {nBeams} beam(s)")
+      except Exception as _e:
+        logging.warning(f"Could not read beam count from plan: {_e}")
 
-    # Execute simulation
-    logging.info("Executing TOPAS simulation...")
-    TopasDoseEngineUtil.executeTopasSimulation(inputFilePath, topasBinaryPath, workingDirectory, g4dataPath, timeout)
+    beamDoseFiles = []
+    for beamIdx in range(1, nBeams + 1):
+      beamWorkDir = os.path.join(workingDirectory, f'beam{beamIdx}')
+      os.makedirs(beamWorkDir, exist_ok=True)
 
-    # Find the dose output file
-    logging.info("Locating DICOM RT Dose output...")
-    doseFilePath = TopasDoseEngineUtil.findDoseOutputFile(workingDirectory)
+      logging.info(f"Creating TOPAS input file for beam {beamIdx}/{nBeams}...")
+      inputFilePath = TopasDoseEngineUtil.createTopasInputFileDicom(
+        dicomDirectory=dicomDirectory,
+        beamProperties=beamProperties,
+        workingDirectory=beamWorkDir,
+        topasDirectory=topasDirectoryPath,
+        ctData=ctData,
+        planFilePath=planFilePath,
+        beamNumber=beamIdx
+      )
+
+      logging.info(f"Executing TOPAS simulation for beam {beamIdx}/{nBeams}...")
+      TopasDoseEngineUtil.executeTopasSimulation(inputFilePath, topasBinaryPath, beamWorkDir, g4dataPath, timeout)
+
+      logging.info(f"Locating dose output for beam {beamIdx}...")
+      beamDoseFiles.append(TopasDoseEngineUtil.findDoseOutputFile(beamWorkDir))
+
+    # Sum doses from all beams into a single RT Dose file
+    if nBeams == 1:
+      doseFilePath = beamDoseFiles[0]
+    else:
+      logging.info(f"Summing doses from {nBeams} beams...")
+      doseFilePath = TopasDoseEngineUtil._sumDoseDicomFiles(beamDoseFiles, workingDirectory)
 
     return doseFilePath, workingDirectory
+
+  #------------------------------------------------------------------------------
+  @staticmethod
+  def _sumDoseDicomFiles(doseFilePaths, workingDirectory):
+    """Sum multiple DICOM RT Dose files into one.
+
+    Each file's pixel values are converted to physical dose (Gy) via its
+    DoseGridScaling, summed, then stored back with a new scaling factor.
+    The first file's metadata (geometry, SOP UIDs, etc.) is used as the base.
+    """
+    import pydicom, numpy as np
+    datasets = [pydicom.dcmread(p) for p in doseFilePaths]
+
+    # Convert each to float dose array in Gy
+    dose_sum = None
+    for ds in datasets:
+      scaling = float(ds.DoseGridScaling)
+      arr = ds.pixel_array.astype(np.float64) * scaling
+      dose_sum = arr if dose_sum is None else dose_sum + arr
+
+    # Store back into the first dataset
+    out = datasets[0]
+    new_scaling = float(dose_sum.max()) / (2**32 - 1) if dose_sum.max() > 0 else 1e-6
+    new_scaling = max(new_scaling, 1e-9)
+    pixel_data = (dose_sum / new_scaling).astype(np.uint32)
+
+    out.DoseGridScaling = new_scaling
+    out.BitsAllocated = 32
+    out.BitsStored = 32
+    out.HighBit = 31
+    out.PixelRepresentation = 0
+    out.PixelData = pixel_data.tobytes()
+    out.NumberOfFrames = pixel_data.shape[0]
+
+    sumPath = os.path.join(workingDirectory, 'dose_sum.dcm')
+    out.save_as(sumPath)
+    logging.info(f"Summed dose written to {sumPath}")
+    return sumPath
 
   #------------------------------------------------------------------------------
   @staticmethod
