@@ -78,6 +78,7 @@
 #include <QTime>
 #include <QItemSelection>
 #include <QMessageBox>
+#include <QSignalBlocker>
 #include <QDir>
 
 // PythonQt includes
@@ -479,8 +480,10 @@ void qSlicerExternalBeamPlanningModuleWidget::updateWidgetFromMRML()
     return;
   }
 
-  // Plan parameters section
-  d->checkBox_IonPlanFlag->setChecked(planNode->GetIonPlanFlag());
+  // Plan parameters section. The check state is assigned rather than the boolean so that the state
+  // the checkbox reports to the outside world stays correct even when this runs while a click on it
+  // is still being handled, which happens whenever changing the flag modifies the plan
+  d->checkBox_IonPlanFlag->setCheckState(planNode->GetIonPlanFlag() ? Qt::Checked : Qt::Unchecked);
 
   // None is enabled for the reference volume and segmentation comboboxes, and invalid selection
   // in plan node is set to GUI so that the user needs to select nodes that are then set to the beams.
@@ -1089,6 +1092,29 @@ void qSlicerExternalBeamPlanningModuleWidget::ionPlanFlagCheckboxStateChanged(in
   bool ionPlanFlagChanged = (planNode->GetIonPlanFlag() != static_cast<bool>(state));
   if (ionPlanFlagChanged)
   {
+    // Deleting every beam in the plan is not something the user can undo, and the checkbox is easy
+    // to hit by accident, so ask for confirmation whenever there is anything to lose
+    if (planNode->GetNumberOfBeams() > 0)
+    {
+      QString message = tr("Ion beams and conventional beams are different types of object that cannot be "
+        "converted into one another, so changing this option deletes every beam currently in plan '%1'.\n\n"
+        "Do you want to continue?").arg(planNode->GetName());
+      QMessageBox::StandardButton answer = QMessageBox::question(
+        this, tr("Delete all beams in the plan?"), message,
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+      if (answer != QMessageBox::Yes)
+      {
+        // Put the checkbox back the way it was without running this handler again. The check state
+        // has to be assigned rather than the boolean, because a checkbox only refreshes the state it
+        // reports to the outside world when it is not in the middle of handling a click. Assigning
+        // the boolean from here would leave it remembering the state the user just tried to set, and
+        // the next click would then look like no change at all and be silently swallowed
+        const QSignalBlocker blocker(d->checkBox_IonPlanFlag);
+        d->checkBox_IonPlanFlag->setCheckState(planNode->GetIonPlanFlag() ? Qt::Checked : Qt::Unchecked);
+        return;
+      }
+    }
+
     // delete all beams
     planNode->RemoveAllBeams();
   }

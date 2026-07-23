@@ -249,6 +249,11 @@ protected:
   /// Create default plan POIs markups node
   vtkMRMLMarkupsFiducialNode* CreateMarkupsFiducialNode();
 
+  /// Remove the sequence browser and the sequences that animate the given beam, along with the other
+  /// proxy nodes they drive. Does nothing for a beam that is not part of a sequence. The beam itself
+  /// is not removed. \sa RemoveBeam
+  void RemoveSequencesForBeam(vtkMRMLRTBeamNode* beam);
+
 protected:
   vtkMRMLRTPlanNode();
   ~vtkMRMLRTPlanNode();

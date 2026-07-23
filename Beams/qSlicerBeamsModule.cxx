@@ -75,7 +75,7 @@ qSlicerBeamsModule::~qSlicerBeamsModule() = default;
 //-----------------------------------------------------------------------------
 QStringList qSlicerBeamsModule::dependencies()const
 {
-  return QStringList() << "Models" << "Segmentations";
+  return QStringList() << "Models" << "Segmentations" << "Sequences";
 }
 
 //-----------------------------------------------------------------------------

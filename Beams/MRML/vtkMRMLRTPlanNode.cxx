@@ -35,6 +35,10 @@
 #include <vtkMRMLScalarVolumeNode.h>
 #include <vtkMRMLTableNode.h>
 
+// Sequences includes
+#include <vtkMRMLSequenceBrowserNode.h>
+#include <vtkMRMLSequenceNode.h>
+
 // VTK includes
 #include <vtkCollection.h>
 #include <vtkDataArray.h>
@@ -731,13 +735,16 @@ void vtkMRMLRTPlanNode::RemoveBeam(vtkMRMLRTBeamNode* beamNode)
   // Fire beam added event (do it first so that operations can be performed with beam while exists)
   this->InvokeEvent(vtkMRMLRTPlanNode::BeamRemoved, (void*)beamNode->GetID());
 
+  // Discard the animation this beam belongs to, if any, before the beam itself goes away
+  this->RemoveSequencesForBeam(beamNode);
+
   // Remove range shifter node exclusively owned by an ion beam. Otherwise it is left behind in the
   // scene with no parent beam, which breaks 3D view auto-centering.
   vtkMRMLRTIonBeamNode* ionBeamNode = vtkMRMLRTIonBeamNode::SafeDownCast(beamNode);
   if (ionBeamNode)
   {
     vtkMRMLRTIonRangeShifterNode* rangeShifterNode = ionBeamNode->GetRangeShifterNode();
-    if (rangeShifterNode)
+    if (rangeShifterNode && this->GetScene()->IsNodePresent(rangeShifterNode))
     {
       this->GetScene()->RemoveNode(rangeShifterNode);
     }
@@ -747,6 +754,66 @@ void vtkMRMLRTPlanNode::RemoveBeam(vtkMRMLRTBeamNode* beamNode)
   this->GetScene()->RemoveNode(beamNode);
 
   this->Modified();
+}
+
+//---------------------------------------------------------------------------
+void vtkMRMLRTPlanNode::RemoveSequencesForBeam(vtkMRMLRTBeamNode* beamNode)
+{
+  vtkMRMLScene* scene = this->GetScene();
+  if (!scene || !beamNode || !beamNode->GetID())
+  {
+    return;
+  }
+
+  // A beam loaded from a DICOM dynamic beam sequence is the proxy node of a sequence browser, which
+  // also drives the beam transform, the leaf position or scan spot table, and the range shifter.
+  // Removing only the beam leaves the browser behind, and the sequences module then re-creates the
+  // missing proxy at the top level of the scene, outside of any plan, so the beam appears to come
+  // back from the dead as a stray item. Take the whole animation with it instead
+  std::vector<vtkMRMLNode*> candidateBrowserNodes;
+  scene->GetNodesByClass("vtkMRMLSequenceBrowserNode", candidateBrowserNodes);
+
+  vtkSmartPointer<vtkMRMLSequenceBrowserNode> browserNode;
+  for (vtkMRMLNode* node : candidateBrowserNodes)
+  {
+    vtkMRMLSequenceBrowserNode* currentBrowserNode = vtkMRMLSequenceBrowserNode::SafeDownCast(node);
+    if (currentBrowserNode && currentBrowserNode->IsProxyNodeID(beamNode->GetID()))
+    {
+      browserNode = currentBrowserNode;
+      break;
+    }
+  }
+  if (!browserNode)
+  {
+    // Static beam, nothing else to clean up
+    return;
+  }
+
+  std::vector<vtkMRMLNode*> proxyNodes;
+  browserNode->GetAllProxyNodes(proxyNodes);
+  std::vector<vtkMRMLSequenceNode*> sequenceNodes;
+  browserNode->GetSynchronizedSequenceNodes(sequenceNodes, true);
+
+  // Remove the browser first so that it cannot restore any proxy while the rest is being removed
+  scene->RemoveNode(browserNode);
+
+  for (vtkMRMLSequenceNode* sequenceNode : sequenceNodes)
+  {
+    if (sequenceNode)
+    {
+      scene->RemoveNode(sequenceNode);
+    }
+  }
+
+  // The remaining proxies belong to the beam and are meaningless without it. The beam itself is left
+  // for the caller to remove, so that the events it still needs to fire happen in the right order.
+  for (vtkMRMLNode* proxyNode : proxyNodes)
+  {
+    if (proxyNode && proxyNode != beamNode)
+    {
+      scene->RemoveNode(proxyNode);
+    }
+  }
 }
 
 //---------------------------------------------------------------------------
