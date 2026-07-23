@@ -62,6 +62,7 @@ qSlicerPlmProtonDoseEngine::qSlicerPlmProtonDoseEngine(QObject* parent)
   : qSlicerAbstractDoseEngine(parent)
 {
   this->m_Name = QString("Plastimatch proton");
+  this->m_CanDoIonPlan = true;
 }
 
 //----------------------------------------------------------------------------

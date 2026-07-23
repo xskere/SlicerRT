@@ -857,5 +857,8 @@ void qSlicerAbstractDoseEngine::setDoseEngineTypeToBeam(vtkMRMLRTBeamNode* beamN
 //-----------------------------------------------------------------------------
 void  qSlicerAbstractDoseEngine::updateBeamParametersForIonPlan(bool isIonPlanActive)
 {
-  qCritical() << Q_FUNC_INFO << ": updateBeamParamtersForIonPlan not implemented";
+  Q_UNUSED(isIonPlanActive);
+  // Nothing to do by default. Only an engine whose beam parameters differ between ion and
+  // conventional plans needs to react to this, and an engine that offers the same parameters
+  // either way is not doing anything wrong by ignoring it
 }
