@@ -9,6 +9,7 @@ set(${KIT}_INCLUDE_DIRECTORIES
   ${Slicer_Base_INCLUDE_DIRS}
   ${MRMLCore_INCLUDE_DIRS}
   ${vtkSlicerSegmentationsModuleLogic_INCLUDE_DIRS}
+  ${vtkSlicerSequencesModuleMRML_INCLUDE_DIRS}
   )
 
 # --------------------------------------------------------------------------
@@ -31,6 +32,7 @@ SET (${KIT}_INCLUDE_DIRS
   ${vtkSlicerSegmentationsModuleLogic_INCLUDE_DIRS}
   ${Slicer_Base_INCLUDE_DIRS}
   ${MRMLCore_INCLUDE_DIRS}
+  ${vtkSlicerSequencesModuleMRML_INCLUDE_DIRS}
   CACHE INTERNAL "" FORCE)
 
 # --------------------------------------------------------------------------
@@ -43,6 +45,7 @@ set(${KIT}_TARGET_LIBRARIES
   vtkSlicerSegmentationsModuleLogic
   MRMLCore
   vtkSlicerMarkupsModuleMRML
+  vtkSlicerSequencesModuleMRML
   )
 
 SlicerMacroBuildModuleMRML(
